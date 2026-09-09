@@ -96,3 +96,14 @@ fallback.
 - Token usage lands in `agent stream protocol summary`.
 - `MULTICA_ZCODE_PATH` points at the desktop-bundled
   `…/ZCode.app/Contents/Resources/glm/zcode.cjs` via a `node` wrapper.
+
+## Status (2026-09-10)
+
+Implemented and deployed on one machine against the v0.4.41 tree: descriptor
+site changes, a zcode driver speaking the app-server protocol over NDJSON,
+live model-catalog discovery via session/create's `settings.model.available`,
+and the probe / display-name / skills / execenv / metrics plumbing. A snapshot
+of the daemon-side driver lives in `upstream/zcode_driver.go.reference` (same
+package layout, compile-verified against the tree; not submitted upstream).
+Verified wire shapes (setModel / setThoughtLevel / stop, zcode 0.15.2) are
+documented in `protocol/PROTOCOL.md`.
