@@ -61,6 +61,16 @@ spawn and re-syncs `builtin:zai*` provider keys from the desktop config
 (`~/.zcode/v2/config.json` → `~/.zcode/cli/config.json`), so runs keep working
 without manual re-copying.
 
+## Native provider deployment (this machine)
+
+This machine now runs a **natively patched Multica daemon** where zcode is a
+first-class provider: real GLM model catalog discovered live from
+`session/create`, native "ZCode" display name and logo, correct provider key —
+no claude-family impersonation. This repo remains the distribution for stock
+Multica installs (bridge + runtime profile). If you deploy the native provider
+following `upstream/INTEGRATION.md`, `bridge/uninstall.sh` cleanly removes the
+profile-based runtime and the agent repoints to the native one.
+
 ## What the bridge supports
 
 | Capability | Status |
