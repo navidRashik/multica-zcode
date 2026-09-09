@@ -94,6 +94,24 @@ upsertModelProvider, readState, …}`, `plugins/*`, `usage/stats`.
 `maxOutputTokens`, `reasoning.levels[]`) — enough to populate a provider's
 model list without any static table.
 
+## Verified param shapes (zcode 0.15.2, 2026-09-10)
+
+- `session/setModel` — `{"sessionId", "model": {"providerId", "modelId"}}`.
+  The key MUST be `model` (a `ref` key is rejected with an Unrecognized-key
+  ZodError). Success returns the updated projection; the context window in
+  `projection.contextWindow` reflects the newly selected model.
+- `session/setThoughtLevel` — `{"sessionId", "thoughtLevel": "enabled"|"disabled"}`.
+  The keys `level` and `value` are rejected. Note: even though the catalog
+  advertises `enabled`, zcode 0.15.2 answers `"Unsupported reasoning effort:
+  enabled"` for GLM-5.3 — the session default already has thinking on, so
+  only the explicit `disabled` mapping is useful in practice.
+- `session/stop` — `{"sessionId"}`; returns `{}` immediately and ends the
+  running turn.
+- Model catalog entries observed: `ref.providerId` is either `"zai"` (glm-5.1,
+  glm-4.7) or `"builtin:zai-coding-plan"` (GLM-5.3, GLM-5.3-Flash); refs are
+  therefore not slash-joinable into one uniform namespace — keep providerId
+  and modelId apart and join with `/` only as a Multica-side ID convention.
+
 ## Errors
 
 Zod validation failures come back as

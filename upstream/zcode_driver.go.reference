@@ -1,0 +1,553 @@
+package agent
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/exec"
+	"strings"
+	"sync"
+	"time"
+)
+
+// zcodeBackend drives the ZCode CLI's native "ZCode Protocol" app-server:
+// `zcode app-server`, one long-lived NDJSON child per run. Requests are
+// {id, method, params}; responses {id, result|error}; notifications carry
+// {method, params}. The handshake creates (or resumes) a session, switches it
+// to yolo mode, subscribes to desktop-continuous event delivery, and delivers
+// the prompt via session/send. The turn's terminal event carries the final
+// response plus usage; tool_input_start notifications stream tool calls live
+// so Multica's execution log mirrors the run.
+//
+// Unlike every stream-JSON CLI, zcode takes NO argv beyond the subcommand:
+// prompt, model, resume, and permissions all ride protocol messages, so
+// ExtraArgs/CustomArgs have no channel and are deliberately dropped (a warning
+// is logged when a run carries any). The runtime brief reaches zcode through
+// the per-task AGENTS.md execenv writes — zcode's own context source list is
+// AGENTS.md — so SystemPrompt is never needed here either.
+type zcodeBackend struct {
+	cfg Config
+}
+
+// zcodeHandshakeTimeout bounds each startup RPC (create/resume, setMode,
+// subscribe, setModel, send). The turn itself is bounded by ExecOptions.Timeout
+// and the daemon's inactivity watchdogs, not by this.
+const zcodeHandshakeTimeout = 20 * time.Second
+
+// zcodeFrame is any wire message: request, response, or notification.
+type zcodeFrame struct {
+	ID     *string          `json:"id,omitempty"`
+	Method string           `json:"method,omitempty"`
+	Params json.RawMessage  `json:"params,omitempty"`
+	Result json.RawMessage  `json:"result,omitempty"`
+	Error  *zcodeProtoError `json:"error,omitempty"`
+}
+
+type zcodeProtoError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *zcodeProtoError) Error() string {
+	return fmt.Sprintf("zcode: %s (code %d)", e.Message, e.Code)
+}
+
+// zcodeEvent is a session/event notification payload.
+type zcodeEvent struct {
+	SessionID string          `json:"sessionId"`
+	EventID   string          `json:"eventId"`
+	Payload   json.RawMessage `json:"payload"`
+}
+
+// zcodeToolEvent is the payload of tool_input_start / tool_input_end events.
+type zcodeToolEvent struct {
+	Kind              string `json:"kind"`
+	AssistantMessageID string `json:"assistantMessageId"`
+	ToolCallID        string `json:"toolCallId"`
+	ToolName          string `json:"toolName"`
+	Delta             string `json:"delta"`
+	Done              bool   `json:"done"`
+}
+
+// zcodeCompletion is the terminal turn event payload (response + usage).
+type zcodeCompletion struct {
+	Response string `json:"response"`
+	Usage    struct {
+		InputTokens      int64 `json:"inputTokens"`
+		OutputTokens     int64 `json:"outputTokens"`
+		TotalTokens      int64 `json:"totalTokens"`
+		CacheReadTokens  int64 `json:"cacheReadTokens"`
+		CacheWriteTokens int64 `json:"cacheWriteTokens"`
+	} `json:"usage"`
+}
+
+// zcodeIsCompletion reports whether the event payload is the terminal turn
+// event: the one payload carrying both the response text and usage.
+func zcodeIsCompletion(payload json.RawMessage) bool {
+	var probe struct {
+		Response *json.RawMessage `json:"response"`
+		Usage    *json.RawMessage `json:"usage"`
+	}
+	return json.Unmarshal(payload, &probe) == nil && probe.Response != nil && probe.Usage != nil
+}
+
+// zcodeServer is a running `zcode app-server` child with request/response
+// correlation and event delivery. Server→client requests are auto-answered:
+// the runtime-preferences handshake needs an explicit boolean, permission
+// prompts (only expected outside yolo) accept their first "allow" option, and
+// telemetry-style calls accept an empty result. Unanswered server requests
+// block their originating call, so everything gets a reply.
+type zcodeServer struct {
+	cmd    *exec.Cmd
+	stdin  io.WriteCloser
+	events chan zcodeEvent
+	dead   chan struct{}
+
+	mu      sync.Mutex
+	pending map[string]chan zcodeFrame
+	nextID  int
+}
+
+func (b *zcodeBackend) newServer(cmd *exec.Cmd, stdout io.Reader, stdin io.WriteCloser) *zcodeServer {
+	s := &zcodeServer{
+		cmd:     cmd,
+		stdin:   stdin,
+		events:  make(chan zcodeEvent, 256),
+		dead:    make(chan struct{}),
+		pending: map[string]chan zcodeFrame{},
+	}
+	go s.readLoop(stdout)
+	return s
+}
+
+func (s *zcodeServer) readLoop(stdout io.Reader) {
+	defer close(s.dead)
+	scanner := newAgentStreamScanner(stdout)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var msg zcodeFrame
+		if err := json.Unmarshal([]byte(line), &msg); err != nil {
+			continue
+		}
+		switch {
+		case msg.ID != nil && (msg.Result != nil || msg.Error != nil):
+			s.mu.Lock()
+			ch := s.pending[*msg.ID]
+			delete(s.pending, *msg.ID)
+			s.mu.Unlock()
+			if ch != nil {
+				ch <- msg
+			}
+		case msg.Method == "session/event":
+			var ev zcodeEvent
+			if json.Unmarshal(msg.Params, &ev) == nil {
+				select {
+				case s.events <- ev:
+				default:
+					// Drop on overflow: the completion event is what decides the
+					// run, and progress events are best-effort.
+				}
+			}
+		case msg.Method != "":
+			s.autoAnswer(msg)
+		}
+	}
+}
+
+func (s *zcodeServer) autoAnswer(req zcodeFrame) {
+	if req.ID == nil {
+		return
+	}
+	result := json.RawMessage("{}")
+	switch req.Method {
+	case "session/requestRuntimePreferences":
+		result = json.RawMessage(`{"nativeSearchEnhancementsEnabled":false}`)
+	default:
+		// Permission prompts (interaction/requestPermission and friends) are
+		// only expected outside yolo mode. Answer with the first offered
+		// "allow" response when one exists, mirroring the bridge.
+		var params struct {
+			Options []struct {
+				Response json.RawMessage `json:"response"`
+			} `json:"options"`
+		}
+		if json.Unmarshal(req.Params, &params) == nil {
+			for _, opt := range params.Options {
+				var decision struct {
+					Decision string `json:"decision"`
+				}
+				if json.Unmarshal(opt.Response, &decision) == nil && decision.Decision == "allow" {
+					result = opt.Response
+					break
+				}
+			}
+		}
+	}
+	s.reply(*req.ID, result)
+}
+
+func (s *zcodeServer) reply(id string, result json.RawMessage) {
+	frame, _ := json.Marshal(map[string]any{"id": id, "result": result})
+	_, _ = s.stdin.Write(append(frame, '\n'))
+}
+
+// call sends a request and waits for its response within the caller's context.
+func (s *zcodeServer) call(ctx context.Context, method string, params any) (json.RawMessage, error) {
+	s.mu.Lock()
+	s.nextID++
+	id := fmt.Sprintf("mc-%d", s.nextID)
+	ch := make(chan zcodeFrame, 1)
+	s.pending[id] = ch
+	s.mu.Unlock()
+
+	frame, err := json.Marshal(map[string]any{"id": id, "method": method, "params": params})
+	if err != nil {
+		return nil, err
+	}
+	if _, err := s.stdin.Write(append(frame, '\n')); err != nil {
+		s.mu.Lock()
+		delete(s.pending, id)
+		s.mu.Unlock()
+		return nil, fmt.Errorf("%s: write: %w", method, err)
+	}
+	select {
+	case msg := <-ch:
+		if msg.Error != nil {
+			return nil, msg.Error
+		}
+		return msg.Result, nil
+	case <-s.dead:
+		s.mu.Lock()
+		delete(s.pending, id)
+		s.mu.Unlock()
+		return nil, fmt.Errorf("%s: app-server exited before responding", method)
+	case <-ctx.Done():
+		s.mu.Lock()
+		delete(s.pending, id)
+		s.mu.Unlock()
+		return nil, fmt.Errorf("%s: %w", method, ctx.Err())
+	}
+}
+
+// zcodeSessionRef identifies the session model for usage accounting.
+type zcodeSessionRef struct {
+	SessionID string
+	Model     string // "providerId/modelId" of the session's resolved model
+}
+
+// startSession performs the handshake: resume (falling back to a fresh
+// session) or create, then setMode yolo + subscribe desktop-continuous. The
+// returned bool reports whether a requested resume was rejected (the fresh
+// fallback ran); resumedOK is false only when resume was attempted and failed.
+func (s *zcodeServer) startSession(ctx context.Context, workdir, resumeSessionID string) (zcodeSessionRef, bool, error) {
+	ref := zcodeSessionRef{}
+	if resumeSessionID != "" {
+		var res struct {
+			Session struct {
+				SessionID string `json:"sessionId"`
+				Model     struct {
+					ProviderID string `json:"providerId"`
+					ModelID    string `json:"modelId"`
+				} `json:"model"`
+			} `json:"session"`
+		}
+		_, err := s.call(ctx, "session/resume", map[string]any{"sessionId": resumeSessionID})
+		if err == nil {
+			if uerr := json.Unmarshal(mustMarshal(map[string]any{"session": map[string]any{}}), &res); uerr != nil {
+				// unreachable: static input
+			}
+			ref.SessionID = resumeSessionID
+			return ref, false, nil
+		}
+		// Fall through to a fresh session; the caller records the rejection.
+		ref.ResumeFailed = err
+	}
+	var res struct {
+		Session struct {
+			SessionID string `json:"sessionId"`
+			Model     struct {
+				ProviderID string `json:"providerId"`
+				ModelID    string `json:"modelId"`
+			} `json:"model"`
+		} `json:"session"`
+	}
+	raw, err := s.call(ctx, "session/create", map[string]any{
+		"workspace": map[string]any{"workspacePath": workdir, "workspaceKey": workdir},
+	})
+	if err != nil {
+		return ref, false, err
+	}
+	if err := json.Unmarshal(raw, &res); err != nil {
+		return ref, false, fmt.Errorf("session/create: parse response: %w", err)
+	}
+	if res.Session.SessionID == "" {
+		return ref, false, fmt.Errorf("session/create returned no sessionId")
+	}
+	ref.SessionID = res.Session.SessionID
+	if res.Session.Model.ProviderID != "" && res.Session.Model.ModelID != "" {
+		ref.Model = res.Session.Model.ProviderID + "/" + res.Session.Model.ModelID
+	}
+	for _, call := range []struct {
+		method string
+		params map[string]any
+	}{
+		{"session/setMode", map[string]any{"sessionId": ref.SessionID, "mode": "yolo"}},
+		{"session/subscribe", map[string]any{"sessionId": ref.SessionID, "deliveryKind": "desktop-continuous"}},
+	} {
+		if _, err := s.call(ctx, call.method, call.params); err != nil {
+			return ref, false, fmt.Errorf("%s: %w", call.method, err)
+		}
+	}
+	return ref, false, nil
+}
+
+func mustMarshal(v any) json.RawMessage {
+	b, _ := json.Marshal(v)
+	return b
+}
+
+// zcodeModelRef splits a persisted model id ("providerId/modelId") back into
+// the ref session/setModel expects. The providerId half may itself contain
+// ":" (e.g. "builtin:zai-coding-plan/GLM-5.3") but never "/", so a single
+// SplitN on the first slash is exact.
+func zcodeModelRef(model string) (providerID, modelID string, ok bool) {
+	parts := strings.SplitN(model, "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
+func (b *zcodeBackend) Execute(ctx context.Context, prompt string, opts ExecOptions) (*Session, error) {
+	execName := b.cfg.ExecutablePath
+	if execName == "" {
+		execName = "zcode"
+	}
+	lookedUp, err := exec.LookPath(execName)
+	if err != nil {
+		return nil, fmt.Errorf("zcode executable not found at %q: %w", execName, err)
+	}
+	if len(opts.ExtraArgs) > 0 || len(opts.CustomArgs) > 0 {
+		b.cfg.Logger.Warn("zcode takes no CLI arguments (protocol-driven app-server); dropping args",
+			"extra_args", len(opts.ExtraArgs), "custom_args", len(opts.CustomArgs))
+	}
+	if len(opts.McpConfig) > 0 {
+		b.cfg.Logger.Warn("zcode backend does not consume McpConfig; ignoring")
+	}
+
+	cwd := opts.Cwd
+	if cwd == "" {
+		if cwd, err = os.Getwd(); err != nil {
+			cwd = "."
+		}
+	}
+
+	runCtx, cancel := runContext(ctx, opts.Timeout)
+	cmd := b.cfg.commandAt(lookedUp).exec(runCtx, "app-server")
+	hideAgentWindow(cmd)
+	b.cfg.logAgentCommand(cmd, newAgentCommandLogArgs([]string{"app-server"}))
+	cmd.WaitDelay = 10 * time.Second
+	cmd.Dir = cwd
+	cmd.Env = buildEnv(b.cfg.Env)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("zcode stdout pipe: %w", err)
+	}
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		cancel()
+		return nil, fmt.Errorf("zcode stdin pipe: %w", err)
+	}
+	stderrBuf := newStderrTail(newLogWriter(b.cfg.Logger, "[zcode:stderr] "), agentStderrTailBytes)
+	cmd.Stderr = stderrBuf
+	if err := startOwnedProcessTree(cmd, b.cfg.Logger); err != nil {
+		cancel()
+		return nil, fmt.Errorf("start zcode app-server: %w", err)
+	}
+	b.cfg.Logger.Info("zcode app-server started", "pid", cmd.Process.Pid, "cwd", cwd, "model", opts.Model)
+
+	srv := b.newServer(cmd, stdout, stdin)
+
+	msgCh := make(chan Message, 256)
+	resCh := make(chan Result, 1)
+	go func() {
+		defer cancel()
+		defer close(msgCh)
+		defer close(resCh)
+		started := time.Now()
+		res := b.runTurn(runCtx, srv, cwd, prompt, opts, msgCh, stderrBuf)
+		res.DurationMs = time.Since(started).Milliseconds()
+		b.cfg.Logger.Info("zcode finished", "pid", cmd.Process.Pid, "status", res.Status,
+			"duration", time.Duration(res.DurationMs)*time.Millisecond)
+		// Terminate the child; Wait reaps it and releases the process group.
+		_ = srv.cmd.Process.Kill()
+		_, _ = srv.cmd.Process.Wait()
+		releaseProcessGroup(srv.cmd)
+		resCh <- res
+	}()
+	return &Session{Messages: msgCh, Result: resCh}, nil
+}
+
+func (b *zcodeBackend) runTurn(
+	runCtx context.Context,
+	srv *zcodeServer,
+	cwd, prompt string,
+	opts ExecOptions,
+	msgCh chan<- Message,
+	stderrBuf *stderrTail,
+) Result {
+	handshakeCtx, hsCancel := context.WithTimeout(runCtx, zcodeHandshakeTimeout)
+	defer hsCancel()
+
+	ref, resumeFailed, err := srv.startSession(handshakeCtx, cwd, opts.ResumeSessionID)
+	if err != nil {
+		if resumeFailed != nil {
+			// A rejected resume must not mask the fresh-session failure cause,
+			// but it decides the resume flags below.
+			err = fmt.Errorf("resume failed (%v); fresh session also failed: %w", resumeFailed, err)
+		}
+		return zcodeFailure(err, stderrBuf, "", runCtx, opts.ResumeSessionID != "")
+	}
+
+	trySend(msgCh, Message{Type: MessageStatus, Status: "running", SessionID: ref.SessionID})
+
+	modelKey := ref.Model
+	if opts.Model != "" {
+		modelKey = opts.Model
+	}
+	if providerID, modelID, ok := zcodeModelRef(opts.Model); ok {
+		if _, err := srv.call(handshakeCtx, "session/setModel", map[string]any{
+			"sessionId": ref.SessionID,
+			"model":     map[string]any{"providerId": providerID, "modelId": modelID},
+		}); err != nil {
+			b.cfg.Logger.Warn("zcode session/setModel failed; continuing with the session default", "error", err.Error())
+		}
+	} else if opts.Model != "" {
+		b.cfg.Logger.Warn("zcode model id is not provider-qualified; skipping session/setModel", "model", opts.Model)
+	}
+	if opts.ThinkingLevel != "" {
+		if _, err := srv.call(handshakeCtx, "session/setThoughtLevel", map[string]any{
+			"sessionId": ref.SessionID,
+			"level":     opts.ThinkingLevel,
+		}); err != nil {
+			b.cfg.Logger.Warn("zcode session/setThoughtLevel failed; continuing with the session default", "error", err.Error())
+		}
+	}
+	if _, err := srv.call(handshakeCtx, "session/send", map[string]any{
+		"sessionId": ref.SessionID,
+		"content":   prompt,
+	}); err != nil {
+		return zcodeFailure(fmt.Errorf("session/send: %w", err), stderrBuf, ref.SessionID, runCtx, opts.ResumeSessionID != "")
+	}
+
+	for {
+		select {
+		case <-runCtx.Done():
+			status := "aborted"
+			if runCtx.Err() == context.DeadlineExceeded {
+				status = "timeout"
+			}
+			return Result{
+				Status: status,
+				Error:  fmt.Sprintf("zcode run did not complete: %v", runCtx.Err()),
+				SessionID:          ref.SessionID,
+				ResumeRejected:     false,
+				ResumeRejectedTransient: opts.ResumeSessionID != "" && opts.ResumeSessionID == ref.SessionID,
+			}
+		case <-srv.dead:
+			return zcodeFailure(fmt.Errorf("zcode app-server exited before the turn completed"), stderrBuf, ref.SessionID, runCtx, opts.ResumeSessionID != "")
+		case ev := <-srv.events:
+			if ev.SessionID != "" && ev.SessionID != ref.SessionID {
+				continue
+			}
+			var payload zcodeToolEvent
+			if json.Unmarshal(ev.Payload, &payload) == nil && payload.Kind == "tool_input_start" && payload.ToolName != "" {
+				input := map[string]any{}
+				if payload.Done && payload.Delta != "" {
+					_ = json.Unmarshal([]byte(payload.Delta), &input)
+				}
+				trySend(msgCh, Message{Type: MessageToolUse, Tool: payload.ToolName, CallID: payload.ToolCallID, Input: input})
+				continue
+			}
+			if !zcodeIsCompletion(ev.Payload) {
+				continue
+			}
+			var done zcodeCompletion
+			if err := json.Unmarshal(ev.Payload, &done); err != nil {
+				return zcodeFailure(fmt.Errorf("zcode completion event: parse: %w", err), stderrBuf, ref.SessionID, runCtx, opts.ResumeSessionID != "")
+			}
+			trySend(msgCh, Message{Type: MessageText, Content: done.Response})
+			key := modelKey
+			if key == "" {
+				key = "zcode"
+			}
+			usage := map[string]TokenUsage{}
+			if done.Usage.InputTokens != 0 || done.Usage.OutputTokens != 0 ||
+				done.Usage.CacheReadTokens != 0 || done.Usage.CacheWriteTokens != 0 {
+				usage[key] = TokenUsage{
+					InputTokens:      done.Usage.InputTokens,
+					OutputTokens:     done.Usage.OutputTokens,
+					CacheReadTokens:  done.Usage.CacheReadTokens,
+					CacheWriteTokens: done.Usage.CacheWriteTokens,
+				}
+			}
+			res := Result{
+				Status:    "completed",
+				Output:    done.Response,
+				SessionID: ref.SessionID,
+				Usage:     usage,
+			}
+			if resumeFailed != nil {
+				res.ResumeRejected = zcodeResumeLooksPermanent(resumeFailed)
+				res.ResumeRejectedTransient = !res.ResumeRejected
+				// The run itself succeeded on the fresh session; the rejection
+				// flags only steer the daemon's session bookkeeping.
+				res.Status = "completed"
+			}
+			return res
+		}
+	}
+}
+
+// zcodeFailure builds the failed-run Result. Resume flags only apply when a
+// resume was requested and never completed the handshake.
+func zcodeFailure(err error, stderrBuf *stderrTail, sessionID string, runCtx context.Context, resumeRequested bool) Result {
+	msg := err.Error()
+	if tail := stderrBuf.Tail(); tail != "" {
+		msg = withAgentStderr(msg, "zcode", tail)
+	}
+	res := Result{
+		Status:    "failed",
+		Output:    "",
+		Error:     msg,
+		SessionID: sessionID,
+	}
+	if runCtx.Err() != nil {
+		res.Status = "timeout"
+		if runCtx.Err() == context.Canceled {
+			res.Status = "aborted"
+		}
+	}
+	return res
+}
+
+// zcodeResumeLooksPermanent reports whether a session/resume error says the
+// session is gone (rather than the transport being unhealthy), which is the
+// daemon's signal to retire the stored session pointer.
+func zcodeResumeLooksPermanent(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "no such session") ||
+		strings.Contains(msg, "unknown session") ||
+		strings.Contains(msg, "invalid session") ||
+		strings.Contains(msg, "expired")
+}
